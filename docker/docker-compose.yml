@@ -2,48 +2,71 @@ version: '3'
 services:
   redis:
     image: redis
-    restart: always
-    volumes:
-      - ./redis/redis.conf:/etc/redis/redis_default.conf
-      - ./redis/data/:/data
+    restart: "no"
+    networks:
+      - default
     environment:
       TZ: "Asia/Shanghai"
-    command: redis-server /etc/redis/redis_default.conf --appendonly yes
+
+  mysql:
+    image: mysql:8.0
+    restart: "no"
+    networks:
+      - default
+    environment:
+      MYSQL_DATABASE: wvp
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_USER: wvp_user
+      MYSQL_PASSWORD: wvp_password
+      TZ: Asia/Shanghai
+    volumes:
+      - ./volumes/mysql/data:/var/lib/mysql
+    command: [
+      '--character-set-server=utf8mb4',
+      '--collation-server=utf8mb4_general_ci',
+      '--default-time-zone=+8:00',
+      '--lower-case-table-names=1'
+    ]
+
   wvp:
     build:
       context: ./wvp
-      args:
-        gitUrl: "https://gitee.com/pan648540858"
-        zlmGitUrl: "https://gitee.com/xia-chu/ZLMediaKit"
-    restart: always
+    restart: "no"
     ports:
-      - "5060:5060"
-      - "5060:5060/udp"
+      - "15060:5060"
+      - "15060:5060/udp"
       - "18080:18080"
-      - "80:80"
       - "10000:10000/tcp"
       - "10000:10000/udp"
       - "30000-30500:30000-30500/tcp"
       - "30000-30500:30000-30500/udp"
+      - "8001:8001"
+      - "18000:18000/udp"
+      - "18000:18000/tcp"
+      - "13000:13000/tcp"
+      - "13001:13001/tcp"
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "50000-50100:50000-50100/udp"
     volumes:
       - ./video:/opt/media/www/record/
       - ./logs/wvp:/opt/wvp/logs/
       - ./logs/assist:/opt/assist/logs/
       - ./logs/media:/opt/media/log/
+      - ./wvp-config-fixed.yml:/opt/wvp/config/application.yml
+      - ./zlm-config-fixed.ini:/opt/media/config.ini
     environment:
       TZ: "Asia/Shanghai"
-      # [必须修改] 本机的IP
-      WVP_HOST: 172.18.0.61
-      WVP_PWD: aseqw_+hiy123
-      WVP_DOMAIN: 6101130049
-      WVP_ID: 61011300490000000001
+      WVP_HOST: 120.196.238.83
+      WVP_PWD: sss168312
+      WVP_DOMAIN: "4401020049"
+      WVP_ID: "34020000002000000001"
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      REDIS_DB: 6
-      REDIS_PWD: root
-      ASSIST_JVM_CONFIG: -Xms128m -Xmx256m
-      WVP_JVM_CONFIG: -Xms128m -Xmx256m
-      ASSIST_CONFIG:
-      WVP_CONFIG:
+      DATABASE_HOST: mysql
+      DATABASE_PORT: 3306
+      DATABASE_USER: wvp_user
+      DATABASE_PASSWORD: wvp_password
     depends_on:
       - redis
+      - mysql

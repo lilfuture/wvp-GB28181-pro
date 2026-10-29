@@ -18,6 +18,7 @@ import com.genersoft.iot.vmp.gb28181.session.SipInviteSessionManager;
 import com.genersoft.iot.vmp.gb28181.transmit.cmd.ISIPCommander;
 import com.genersoft.iot.vmp.gb28181.transmit.cmd.ISIPCommanderForPlatform;
 import com.genersoft.iot.vmp.gb28181.utils.SipUtils;
+import com.genersoft.iot.vmp.gb28181.utils.TalkUtils;
 import com.genersoft.iot.vmp.media.bean.MediaInfo;
 import com.genersoft.iot.vmp.media.bean.MediaServer;
 import com.genersoft.iot.vmp.media.bean.RecordInfo;
@@ -36,6 +37,7 @@ import com.genersoft.iot.vmp.storager.IRedisCatchStorage;
 import com.genersoft.iot.vmp.utils.CloudRecordUtils;
 import com.genersoft.iot.vmp.utils.DateUtil;
 import com.genersoft.iot.vmp.vmanager.bean.AudioBroadcastResult;
+import com.genersoft.iot.vmp.vmanager.bean.AudioBroadcastStatus;
 import com.genersoft.iot.vmp.vmanager.bean.ErrorCode;
 import com.genersoft.iot.vmp.vmanager.bean.StreamContent;
 import gov.nist.javax.sip.message.SIPResponse;
@@ -132,6 +134,11 @@ public class PlayServiceImpl implements IPlayService {
     @org.springframework.context.event.EventListener
     public void onApplicationEvent(MediaArrivalEvent event) {
         if ("broadcast".equals(event.getApp()) || "talk".equals(event.getApp())) {
+            if ("talk".equals(event.getApp()) && TalkUtils.isTalkReceiveStream(event.getStream())) {
+                // 设备回传音频流上线，状态通过 /broadcast/status 查询，避免重复发起 Talk
+                log.info("[语音对讲] 设备回传流已就绪： {}/{}", event.getApp(), event.getStream());
+                return;
+            }
             if (event.getStream().indexOf("_") > 0) {
                 String[] streamArray = event.getStream().split("_");
                 if (streamArray.length == 2) {
@@ -208,8 +215,11 @@ public class PlayServiceImpl implements IPlayService {
         }
 
         if ("broadcast".equals(event.getApp()) || "talk".equals(event.getApp())) {
-            if (event.getStream().indexOf("_") > 0) {
-                String[] streamArray = event.getStream().split("_");
+            String baseStream = "talk".equals(event.getApp())
+                    ? TalkUtils.removeReceiveStreamSuffix(event.getStream())
+                    : event.getStream();
+            if (baseStream.indexOf("_") > 0) {
+                String[] streamArray = baseStream.split("_");
                 if (streamArray.length == 2) {
                     String deviceId = streamArray[0];
                     String channelId = streamArray[1];
@@ -482,71 +492,88 @@ public class PlayServiceImpl implements IPlayService {
         }
         SendRtpInfo sendRtpInfo;
         try {
-            sendRtpInfo = sendRtpServerService.createSendRtpInfo(mediaServerItem, null, null, playSsrc, device.getDeviceId(), "talk", stream,
+            sendRtpInfo = sendRtpServerService.createSendRtpInfo(mediaServerItem, null, null, playSsrc, device.getDeviceId(), TalkUtils.APP_TALK, stream,
                     channel.getId(), true, false);
         }catch (PlayException e) {
             log.info("[语音对讲]开始 获取发流端口失败 deviceId: {}, channelId: {},", device.getDeviceId(), channel.getDeviceId());
+            audioEvent.call("获取发流端口失败");
             return;
         }
+
+        String streamMode = device.getStreamMode();
+        boolean udp = "UDP".equalsIgnoreCase(streamMode);
+        boolean tcpActive = "TCP-ACTIVE".equalsIgnoreCase(streamMode);
+        // TCP-PASSIVE 为默认模式：平台先监听，设备主动连接
+        boolean passive = !udp && !tcpActive;
 
         sendRtpInfo.setOnlyAudio(true);
         sendRtpInfo.setPt(8);
         sendRtpInfo.setStatus(1);
-        sendRtpInfo.setTcpActive(false);
+        sendRtpInfo.setTcp(!udp);
+        sendRtpInfo.setTcpActive(tcpActive);
         sendRtpInfo.setUsePs(false);
-        sendRtpInfo.setReceiveStream(stream + "_talk");
+        sendRtpInfo.setSendToPlatform(false);
+        sendRtpInfo.setReceiveStream(TalkUtils.buildReceiveStream(stream));
 
         String callId = SipUtils.getNewCallId();
-        log.info("[语音对讲]开始 deviceId: {}, channelId: {},收流端口： {}, 收流模式：{}, SSRC: {}, SSRC校验：{}", device.getDeviceId(), channel.getDeviceId(), sendRtpInfo.getLocalPort(), device.getStreamMode(), sendRtpInfo.getSsrc(), false);
-        // 超时处理
+        log.info("[语音对讲]开始 deviceId: {}, channelId: {}, 收流模式：{}, SSRC: {}, 本地端口：{}",
+                device.getDeviceId(), channel.getDeviceId(), streamMode, sendRtpInfo.getSsrc(), sendRtpInfo.getLocalPort());
+        // 超时处理：等待设备回传流建立
         String timeOutTaskKey = UUID.randomUUID().toString();
         dynamicTask.startDelay(timeOutTaskKey, () -> {
-
-            log.info("[语音对讲] 收流超时 deviceId: {}, channelId: {}，端口：{}, SSRC: {}", device.getDeviceId(), channel.getDeviceId(), sendRtpInfo.getPort(), sendRtpInfo.getSsrc());
+            log.info("[语音对讲] 等待设备回传流超时 deviceId: {}, channelId: {}", device.getDeviceId(), channel.getDeviceId());
             timeoutCallback.run();
-            // 点播超时回复BYE 同时释放ssrc以及此次点播的资源
             try {
                 cmder.streamByeCmd(device, channel.getDeviceId(), stream, null);
             } catch (InvalidArgumentException | ParseException | SipException | SsrcTransactionNotFoundException e) {
                 log.error("[语音对讲]超时， 发送BYE失败 {}", e.getMessage());
-            } finally {
-                timeoutCallback.run();
-                mediaServerService.releaseSsrc(mediaServerItem.getId(), sendRtpInfo.getSsrc());
-                sessionManager.removeByStream(sendRtpInfo.getStream());
             }
+            releaseTalkResources(mediaServerItem, sendRtpInfo);
         }, userSetting.getPlayTimeout());
 
-        try {
-            Integer localPort = mediaServerService.startSendRtpPassive(mediaServerItem, sendRtpInfo, userSetting.getPlayTimeout() * 1000);
-            if (localPort == null || localPort <= 0) {
-                timeoutCallback.run();
-                mediaServerService.releaseSsrc(mediaServerItem.getId(), sendRtpInfo.getSsrc());
-                sessionManager.removeByStream(sendRtpInfo.getStream());
+        if (passive) {
+            Integer localPort = null;
+            ControllerException lastError = null;
+            for (int attempt = 0; attempt < 5; attempt++) {
+                try {
+                    localPort = mediaServerService.startSendRtpPassive(mediaServerItem, sendRtpInfo, userSetting.getPlayTimeout() * 1000);
+                    if (localPort != null && localPort > 0) {
+                        lastError = null;
+                        break;
+                    }
+                } catch (ControllerException e) {
+                    lastError = e;
+                }
+                try {
+                    // 源流可能尚未完成 track 装配（ZLM onAllTrackReady 晚于流注册事件），短暂等待后重试
+                    Thread.sleep(200);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            if (lastError != null || localPort == null || localPort <= 0) {
+                log.error("[语音对讲] 启动发流监听失败 deviceId: {}, channelId: {}, {}",
+                        device.getDeviceId(), channel.getDeviceId(), lastError == null ? null : lastError.getMessage());
+                dynamicTask.stop(timeOutTaskKey);
+                audioEvent.call("启动发流监听失败");
+                releaseTalkResources(mediaServerItem, sendRtpInfo);
                 return;
             }
             sendRtpInfo.setPort(localPort);
-        }catch (ControllerException e) {
-            mediaServerService.releaseSsrc(mediaServerItem.getId(), sendRtpInfo.getSsrc());
-            log.info("[语音对讲]失败 deviceId: {}, channelId: {}", device.getDeviceId(), channel.getDeviceId());
-            audioEvent.call("失败, " + e.getMessage());
-            // 查看是否已经建立了通道，存在则发送bye
-            stopTalk(device, channel);
         }
-
 
         // 查看设备是否已经在推流
         try {
             cmder.talkStreamCmd(mediaServerItem, sendRtpInfo, device, channel, callId, (hookData) -> {
-                log.info("[语音对讲] 流已生成， 开始推流： " + hookData);
+                log.info("[语音对讲] 设备回传流已生成：" + hookData);
                 dynamicTask.stop(timeOutTaskKey);
-                // TODO 暂不做处理
+                if (hookEvent != null) {
+                    hookEvent.response(hookData);
+                }
             }, (hookData) -> {
-                log.info("[语音对讲] 设备开始推流： " + hookData);
-                dynamicTask.stop(timeOutTaskKey);
-
+                log.info("[语音对讲] 浏览器推流已开始：" + hookData);
             }, (event) -> {
-                dynamicTask.stop(timeOutTaskKey);
-
                 if (event.event instanceof ResponseEvent) {
                     ResponseEvent responseEvent = (ResponseEvent) event.event;
                     if (responseEvent.getResponse() instanceof SIPResponse) {
@@ -554,45 +581,122 @@ public class PlayServiceImpl implements IPlayService {
                         sendRtpInfo.setFromTag(response.getFromTag());
                         sendRtpInfo.setToTag(response.getToTag());
                         sendRtpInfo.setCallId(response.getCallIdHeader().getCallId());
+                        String responseContent = response.getRawContent() == null ? null : new String(response.getRawContent());
+                        TalkUtils.TalkSdpAddress address = TalkUtils.parseTalkSdp(responseContent, device.getIp(), device.getPort());
+                        if (!address.isCodecSupported()) {
+                            // 设备返回的音频媒体段没有 PCMA/PS，再等下去也无法建立回传，立即结束会话
+                            log.error("[语音对讲] 设备 200 OK 未返回可用音频编码，直接终止 deviceId: {}, channelId: {}, 设备SDP:\r\n{}",
+                                    device.getDeviceId(), channel.getDeviceId(), responseContent);
+                            dynamicTask.stop(timeOutTaskKey);
+                            SsrcTransaction byeTransaction = SsrcTransaction.buildForDevice(device.getDeviceId(), sendRtpInfo.getChannelId(), TalkUtils.APP_TALK,
+                                    sendRtpInfo.getStream(), sendRtpInfo.getSsrc(), sendRtpInfo.getMediaServerId(),
+                                    response, InviteSessionType.TALK);
+                            sessionManager.put(byeTransaction);
+                            try {
+                                cmder.streamByeCmd(device, channel.getDeviceId(), stream, sendRtpInfo.getCallId());
+                            } catch (InvalidArgumentException | ParseException | SipException | SsrcTransactionNotFoundException e) {
+                                log.error("[语音对讲] 编码不兼容，发送BYE失败 {}", e.getMessage());
+                            }
+                            releaseTalkResources(mediaServerItem, sendRtpInfo);
+                            SipSubscribe.EventResult eventResult = new SipSubscribe.EventResult();
+                            eventResult.type = SipSubscribe.EventResultType.cmdSendFailEvent;
+                            eventResult.statusCode = -1;
+                            eventResult.msg = "设备未返回可用音频编码（仅支持 PCMA/8000 或 PS/90000）";
+                            errorEvent.response(eventResult);
+                            return;
+                        }
+                        int previousPt = sendRtpInfo.getPt();
+                        boolean previousUsePs = sendRtpInfo.isUsePs();
+                        sendRtpInfo.setPt(address.getPayloadType());
+                        sendRtpInfo.setUsePs(address.isUsePs());
+                        if (!passive) {
+                            // 被动模式下 port 是平台监听端口，不能被设备 SDP 覆盖
+                            sendRtpInfo.setIp(address.getIp());
+                            sendRtpInfo.setPort(address.getPort());
+                        }
                         sendRtpServerService.update(sendRtpInfo);
 
-                        SsrcTransaction ssrcTransaction = SsrcTransaction.buildForDevice(device.getDeviceId(), sendRtpInfo.getChannelId(), "talk",
+                        SsrcTransaction ssrcTransaction = SsrcTransaction.buildForDevice(device.getDeviceId(), sendRtpInfo.getChannelId(), TalkUtils.APP_TALK,
                                 sendRtpInfo.getStream(), sendRtpInfo.getSsrc(), sendRtpInfo.getMediaServerId(),
                                 response, InviteSessionType.TALK);
-
                         sessionManager.put(ssrcTransaction);
+                        log.info("[语音对讲] 设备协商编码：{}，载荷类型：{}，PS封装：{}", address.getCodec(), address.getPayloadType(), address.isUsePs());
+
+                        if (!passive) {
+                            try {
+                                mediaServerService.startSendRtp(mediaServerItem, sendRtpInfo);
+                            } catch (ControllerException e) {
+                                log.error("[语音对讲] 主动发流失败 deviceId: {}, channelId: {}, {}", device.getDeviceId(), channel.getDeviceId(), e.getMessage());
+                                dynamicTask.stop(timeOutTaskKey);
+                                SipSubscribe.EventResult eventResult = new SipSubscribe.EventResult();
+                                eventResult.type = SipSubscribe.EventResultType.cmdSendFailEvent;
+                                eventResult.statusCode = -1;
+                                eventResult.msg = "主动发流失败: " + e.getMessage();
+                                errorEvent.response(eventResult);
+                                releaseTalkResources(mediaServerItem, sendRtpInfo);
+                                return;
+                            }
+                        } else if (sendRtpInfo.getPt() != previousPt || sendRtpInfo.isUsePs() != previousUsePs) {
+                            // 被动发流在 INVITE 前按默认 PCMA/8 建立，设备选择了其它编码时按协商结果重新下发
+                            reapplyTalkCodec(mediaServerItem, sendRtpInfo);
+                        }
                     } else {
                         log.error("[语音对讲]收到的消息错误，response不是SIPResponse");
                     }
                 } else {
                     log.error("[语音对讲]收到的消息错误，event不是ResponseEvent");
                 }
-
             }, (event) -> {
                 dynamicTask.stop(timeOutTaskKey);
-                mediaServerService.closeRTPServer(mediaServerItem, sendRtpInfo.getStream());
-                // 释放ssrc
-                mediaServerService.releaseSsrc(mediaServerItem.getId(), sendRtpInfo.getSsrc());
-                sessionManager.removeByStream(sendRtpInfo.getStream());
+                releaseTalkResources(mediaServerItem, sendRtpInfo);
                 errorEvent.response(event);
             }, userSetting.getPlayTimeout().longValue());
         } catch (InvalidArgumentException | SipException | ParseException e) {
-
             log.error("[命令发送失败] 对讲消息: {}", e.getMessage());
             dynamicTask.stop(timeOutTaskKey);
-            mediaServerService.closeRTPServer(mediaServerItem, sendRtpInfo.getStream());
-            // 释放ssrc
-            mediaServerService.releaseSsrc(mediaServerItem.getId(), sendRtpInfo.getSsrc());
-
-            sessionManager.removeByStream(sendRtpInfo.getStream());
+            releaseTalkResources(mediaServerItem, sendRtpInfo);
             SipSubscribe.EventResult eventResult = new SipSubscribe.EventResult();
             eventResult.type = SipSubscribe.EventResultType.cmdSendFailEvent;
             eventResult.statusCode = -1;
             eventResult.msg = "命令发送失败";
             errorEvent.response(eventResult);
         }
-//        }
+    }
 
+    private void releaseTalkResources(MediaServer mediaServerItem, SendRtpInfo sendRtpInfo) {
+        try {
+            mediaServerService.closeRTPServer(mediaServerItem, sendRtpInfo.getStream());
+        } catch (Exception e) {
+            log.warn("[语音对讲] 关闭发流端口失败: {}", e.getMessage());
+        }
+        try {
+            mediaServerService.releaseSsrc(mediaServerItem.getId(), sendRtpInfo.getSsrc());
+        } catch (Exception e) {
+            log.warn("[语音对讲] 释放SSRC失败: {}", e.getMessage());
+        }
+        sessionManager.removeByStream(sendRtpInfo.getStream());
+        SendRtpInfo current = sendRtpServerService.queryByChannelId(sendRtpInfo.getChannelId(), sendRtpInfo.getTargetId());
+        if (current != null) {
+            sendRtpServerService.delete(current);
+        }
+    }
+
+    /**
+     * 被动发流会话在 INVITE 前按默认 PCMA/8 建立，设备选择其它编码后按协商结果重新下发，
+     * 保证平台→设备方向的音频封装与设备声明一致。
+     */
+    private void reapplyTalkCodec(MediaServer mediaServerItem, SendRtpInfo sendRtpInfo) {
+        try {
+            Integer localPort = mediaServerService.startSendRtpPassive(mediaServerItem, sendRtpInfo, userSetting.getPlayTimeout() * 1000);
+            if (localPort != null && localPort > 0) {
+                sendRtpInfo.setPort(localPort);
+                sendRtpServerService.update(sendRtpInfo);
+                log.info("[语音对讲] 已按协商编码重新下发被动发流，载荷类型：{}，PS封装：{}，本地端口：{}",
+                        sendRtpInfo.getPt(), sendRtpInfo.isUsePs(), localPort);
+            }
+        } catch (ControllerException e) {
+            log.warn("[语音对讲] 按协商编码重新下发被动发流失败，平台→设备方向可能无声：{}", e.getMessage());
+        }
     }
 
     private void tcpActiveHandler(Device device, DeviceChannel channel, String contentString,
@@ -1208,23 +1312,82 @@ public class PlayServiceImpl implements IPlayService {
 
     @Override
     public AudioBroadcastResult audioBroadcast(Device device, DeviceChannel deviceChannel, Boolean broadcastMode) {
-        // TODO 必须多端口模式才支持语音喊话鹤语音对讲
         if (device == null || deviceChannel == null) {
             return null;
         }
         log.info("[语音喊话] device： {}, channel: {}", device.getDeviceId(), deviceChannel.getDeviceId());
         MediaServer mediaServerItem = mediaServerService.getMediaServerForMinimumLoad(null);
+        if (mediaServerItem == null) {
+            throw new ControllerException(ErrorCode.ERROR100.getCode(), "未找到可用的媒体服务");
+        }
+        if (!mediaServerItem.isRtpEnable()) {
+            throw new ControllerException(ErrorCode.ERROR100.getCode(), "语音广播/对讲需要媒体服务开启多端口模式（media.rtp.enable=true）");
+        }
         if (broadcastMode == null) {
             broadcastMode = true;
         }
-        String app = broadcastMode?"broadcast":"talk";
-        String stream = device.getDeviceId() + "_" + deviceChannel.getDeviceId();
+        String app = broadcastMode ? TalkUtils.APP_BROADCAST : TalkUtils.APP_TALK;
+        String stream = TalkUtils.buildStream(device.getDeviceId(), deviceChannel.getDeviceId());
         AudioBroadcastResult audioBroadcastResult = new AudioBroadcastResult();
         audioBroadcastResult.setApp(app);
         audioBroadcastResult.setStream(stream);
         audioBroadcastResult.setStreamInfo(new StreamContent(mediaServerService.getStreamInfoByAppAndStream(mediaServerItem, app, stream, null, null, null, false)));
         audioBroadcastResult.setCodec("G.711");
+        audioBroadcastResult.setAudioCapability(deviceChannel.isHasAudio());
+        if (!broadcastMode) {
+            String receiveStream = TalkUtils.buildReceiveStream(stream);
+            audioBroadcastResult.setReceiveStreamInfo(new StreamContent(mediaServerService.getStreamInfoByAppAndStream(mediaServerItem, TalkUtils.APP_TALK, receiveStream, null, null, null, true)));
+        }
         return audioBroadcastResult;
+    }
+
+    @Override
+    public AudioBroadcastStatus getAudioBroadcastStatus(Device device, DeviceChannel channel) {
+        AudioBroadcastStatus result = new AudioBroadcastStatus();
+        result.setReceiveStreamReady(false);
+        if (device == null || channel == null) {
+            result.setStatus("Failed");
+            result.setError("设备或通道不存在");
+            return result;
+        }
+        AudioBroadcastCatch audioBroadcastCatch = audioBroadcastManager.get(channel.getId());
+        SendRtpInfo sendRtpInfo = sendRtpServerService.queryByChannelId(channel.getId(), device.getDeviceId());
+        if (audioBroadcastCatch == null && sendRtpInfo == null) {
+            result.setStatus("Idle");
+            return result;
+        }
+        String app = sendRtpInfo != null ? sendRtpInfo.getApp() : audioBroadcastCatch.getApp();
+        String stream = sendRtpInfo != null ? sendRtpInfo.getStream() : audioBroadcastCatch.getStream();
+        result.setApp(app);
+        result.setStream(stream);
+        result.setMode(TalkUtils.APP_TALK.equals(app) ? "talk" : "broadcast");
+        MediaServer mediaServer = sendRtpInfo != null
+                ? mediaServerService.getOne(sendRtpInfo.getMediaServerId())
+                : audioBroadcastCatch.getMediaServerItem();
+        if (mediaServer == null) {
+            result.setStatus("Failed");
+            result.setError("媒体服务不存在");
+            return result;
+        }
+        if (TalkUtils.APP_TALK.equals(app)) {
+            String receiveStream = sendRtpInfo != null && sendRtpInfo.getReceiveStream() != null
+                    ? sendRtpInfo.getReceiveStream()
+                    : TalkUtils.buildReceiveStream(stream);
+            result.setReceiveStream(receiveStream);
+            boolean receiveStreamReady = mediaServerService.isStreamReady(mediaServer, TalkUtils.APP_TALK, receiveStream);
+            result.setReceiveStreamReady(receiveStreamReady);
+            if (receiveStreamReady) {
+                result.setStatus("Ok");
+            } else {
+                result.setStatus(audioBroadcastCatch != null && audioBroadcastCatch.getStatus() != null
+                        ? audioBroadcastCatch.getStatus().name() : "Ready");
+            }
+        } else {
+            boolean streamReady = mediaServerService.isStreamReady(mediaServer, app, stream);
+            result.setStatus(streamReady ? "Ok" : (audioBroadcastCatch != null && audioBroadcastCatch.getStatus() != null
+                    ? audioBroadcastCatch.getStatus().name() : "Ready"));
+        }
+        return result;
     }
 
     @Override
@@ -1292,6 +1455,12 @@ public class PlayServiceImpl implements IPlayService {
     @Override
     public void stopAudioBroadcast(Device device, DeviceChannel channel) {
         log.info("[停止对讲] 设备：{}, 通道：{}", device.getDeviceId(), channel.getDeviceId());
+        if (channel != null) {
+            SendRtpInfo talkSendRtpInfo = sendRtpServerService.queryByChannelId(channel.getId(), device.getDeviceId());
+            if (talkSendRtpInfo != null && TalkUtils.APP_TALK.equals(talkSendRtpInfo.getApp())) {
+                stopTalk(device, channel, null);
+            }
+        }
         List<AudioBroadcastCatch> audioBroadcastCatchList = new ArrayList<>();
         if (channel == null) {
             audioBroadcastCatchList.addAll(audioBroadcastManager.getByDeviceId(device.getDeviceId()));
@@ -1464,7 +1633,8 @@ public class PlayServiceImpl implements IPlayService {
             if (sendRtpInfo != null && sendRtpInfo.isOnlyAudio()) {
                 // 查询流是否存在，不存在则认为是异常状态
                 MediaServer mediaServer = mediaServerService.getOne(sendRtpInfo.getMediaServerId());
-                Boolean streamReady = mediaServerService.isStreamReady(mediaServer, sendRtpInfo.getApp(), sendRtpInfo.getStream());
+                boolean streamReady = mediaServer != null
+                        && mediaServerService.isStreamReady(mediaServer, sendRtpInfo.getApp(), sendRtpInfo.getStream());
                 if (streamReady) {
                     log.warn("[语音对讲] 正在语音广播，无法开启语音通话： {}", channel.getDeviceId());
                     event.call("正在语音广播");
@@ -1476,16 +1646,17 @@ public class PlayServiceImpl implements IPlayService {
         }
 
         SendRtpInfo sendRtpInfo = sendRtpServerService.queryByChannelId(channel.getId(), device.getDeviceId());
-        if (sendRtpInfo != null) {
+        if (sendRtpInfo != null && TalkUtils.APP_TALK.equals(sendRtpInfo.getApp())) {
             MediaServer mediaServer = mediaServerService.getOne(sendRtpInfo.getMediaServerId());
-            Boolean streamReady = mediaServerService.isStreamReady(mediaServer, "rtp", sendRtpInfo.getReceiveStream());
-            if (streamReady) {
-                log.warn("[语音对讲] 进行中： {}", channel.getDeviceId());
-                event.call("语音对讲进行中");
-                return;
-            } else {
-                stopTalk(device, channel);
-            }
+            String receiveStream = sendRtpInfo.getReceiveStream() != null
+                    ? sendRtpInfo.getReceiveStream()
+                    : TalkUtils.buildReceiveStream(sendRtpInfo.getStream());
+            Boolean streamReady = mediaServer != null
+                    && mediaServerService.isStreamReady(mediaServer, TalkUtils.APP_TALK, receiveStream);
+            // 会话可能仍在建立中（等待设备连接或 200 OK），重复发起时不得终止现有会话
+            log.warn("[语音对讲] 进行中： {}, 回传流就绪：{}", channel.getDeviceId(), streamReady);
+            event.call("语音对讲进行中");
+            return;
         }
 
         talk(mediaServerItem, device, channel, stream, (hookData) -> {
@@ -1524,8 +1695,11 @@ public class PlayServiceImpl implements IPlayService {
 
         MediaServer mediaServer = mediaServerService.getOne(mediaServerId);
 
-        if (streamIsReady == null || streamIsReady) {
+        if (mediaServer != null && (streamIsReady == null || streamIsReady)) {
             mediaServerService.stopSendRtp(mediaServer, sendRtpInfo.getApp(), sendRtpInfo.getStream(), sendRtpInfo.getSsrc());
+        }
+        if (mediaServer != null) {
+            mediaServerService.closeRTPServer(mediaServer, sendRtpInfo.getStream());
         }
 
         ssrcFactory.releaseSsrc(mediaServerId, sendRtpInfo.getSsrc());

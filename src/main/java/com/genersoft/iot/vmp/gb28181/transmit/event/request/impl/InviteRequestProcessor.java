@@ -263,21 +263,30 @@ public class InviteRequestProcessor extends SIPRequestProcessorParent implements
             URIField uriField = (URIField)sdp.getURI();
             channelIdFromSdp = uriField.getURI().split(":")[0];
         }
-        final String channelId = StringUtils.isNotBlank(channelIdFromSdp) ? channelIdFromSdp :
+        String channelId = StringUtils.isNotBlank(channelIdFromSdp) ? channelIdFromSdp :
                 (channelIdArrayFromSub != null? channelIdArrayFromSub[0]: null);
+        String sourceChannelId = (channelIdArrayFromSub != null && channelIdArrayFromSub.length == 2) ? channelIdArrayFromSub[1] : null;
         String requesterId = SipUtils.getUserIdFromFromHeader(request);
         CallIdHeader callIdHeader = (CallIdHeader) request.getHeader(CallIdHeader.NAME);
+        if (StringUtils.isNotBlank(requesterId) && channelId == null) {
+            // 部分设备发送语音广播 INVITE 时不带 Subject，按 From 用户回退到该设备正在进行的语音广播会话
+            DeviceChannel broadcastChannel = getOngoingBroadcastChannel(requesterId);
+            if (broadcastChannel != null) {
+                channelId = broadcastChannel.getDeviceId();
+                sourceChannelId = broadcastChannel.getDeviceId();
+                log.info("[解析INVITE消息] 请求缺少Subject，使用进行中的语音广播通道：{}/{}", requesterId, channelId);
+            }
+        }
         if (requesterId == null || channelId == null) {
-            log.warn("[解析INVITE消息] 无法从请求中获取到来源id，返回400错误");
+            log.warn("[解析INVITE消息] 无法从请求中获取到来源id，返回400错误，来源：{}:{}，From用户：{}，Subject通道：{}，请求内容：\r\n{}",
+                    request.getRemoteAddress(), request.getRemotePort(), requesterId, channelId, contentString);
             throw new InviteDecodeException(Response.BAD_REQUEST, "request decode fail");
         }
         log.info("[INVITE] 来源ID: {}, callId: {}, 来自：{}：{}",
                 requesterId, callIdHeader.getCallId(), request.getRemoteAddress(), request.getRemotePort());
         inviteInfo.setRequesterId(requesterId);
         inviteInfo.setTargetChannelId(channelId);
-        if (channelIdArrayFromSub != null && channelIdArrayFromSub.length == 2) {
-            inviteInfo.setSourceChannelId(channelIdArrayFromSub[1]);
-        }
+        inviteInfo.setSourceChannelId(sourceChannelId);
         inviteInfo.setSessionName(sessionName);
         inviteInfo.setSsrc(gb28181Sdp.getSsrc());
         inviteInfo.setCallId(callIdHeader.getCallId());
@@ -349,6 +358,23 @@ public class InviteRequestProcessor extends SIPRequestProcessorParent implements
 
     }
 
+    /**
+     * 根据 INVITE 的 From 用户查找该设备正在进行的语音广播通道
+     */
+    private DeviceChannel getOngoingBroadcastChannel(String requesterId) {
+        List<AudioBroadcastCatch> broadcastCatchList = audioBroadcastManager.getByDeviceId(requesterId);
+        if (broadcastCatchList.isEmpty()) {
+            Device device = deviceService.getDeviceBySourceChannelDeviceId(requesterId);
+            if (device != null) {
+                broadcastCatchList = audioBroadcastManager.getByDeviceId(device.getDeviceId());
+            }
+        }
+        if (broadcastCatchList.isEmpty()) {
+            return null;
+        }
+        return deviceChannelService.getOneForSourceById(broadcastCatchList.get(0).getChannelId());
+    }
+
     private String createSendSdp(SendRtpInfo sendRtpItem, InviteInfo inviteInfo, String sdpIp) {
         StringBuilder content = new StringBuilder(200);
         content.append("v=0\r\n");
@@ -395,6 +421,13 @@ public class InviteRequestProcessor extends SIPRequestProcessorParent implements
 
     public void inviteFromDeviceHandle(SIPRequest request, InviteInfo inviteInfo) {
 
+        if (inviteInfo.getSourceChannelId() == null) {
+            // 部分设备的语音广播 INVITE 只携带目标通道，回退到进行中的语音广播通道
+            DeviceChannel broadcastChannel = getOngoingBroadcastChannel(inviteInfo.getRequesterId());
+            if (broadcastChannel != null) {
+                inviteInfo.setSourceChannelId(broadcastChannel.getDeviceId());
+            }
+        }
         if (inviteInfo.getSourceChannelId() == null) {
             log.warn("来自设备的Invite请求，无法从请求信息中确定请求来自的通道，已忽略，requesterId： {}", inviteInfo.getRequesterId());
             try {

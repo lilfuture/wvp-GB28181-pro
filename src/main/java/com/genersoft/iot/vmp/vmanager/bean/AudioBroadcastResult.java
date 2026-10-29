@@ -24,6 +24,16 @@ public class AudioBroadcastResult {
      */
     private String stream;
 
+    /**
+     * 设备回传音频流的播放地址，仅 Talk 模式返回
+     */
+    private StreamContent receiveStreamInfo;
+
+    /**
+     * 通道是否开启音频能力
+     */
+    private Boolean audioCapability;
+
 
     public StreamContent getStreamInfo() {
         return streamInfo;
@@ -55,5 +65,21 @@ public class AudioBroadcastResult {
 
     public void setStream(String stream) {
         this.stream = stream;
+    }
+
+    public StreamContent getReceiveStreamInfo() {
+        return receiveStreamInfo;
+    }
+
+    public void setReceiveStreamInfo(StreamContent receiveStreamInfo) {
+        this.receiveStreamInfo = receiveStreamInfo;
+    }
+
+    public Boolean getAudioCapability() {
+        return audioCapability;
+    }
+
+    public void setAudioCapability(Boolean audioCapability) {
+        this.audioCapability = audioCapability;
     }
 }

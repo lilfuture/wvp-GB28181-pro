@@ -9,6 +9,7 @@ import com.genersoft.iot.vmp.gb28181.transmit.event.request.impl.message.IMessag
 import com.genersoft.iot.vmp.gb28181.transmit.event.request.impl.message.response.ResponseMessageHandler;
 import gov.nist.javax.sip.message.SIPRequest;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
 import org.dom4j.Element;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -19,6 +20,7 @@ import javax.sip.RequestEvent;
 import javax.sip.SipException;
 import javax.sip.message.Response;
 import java.text.ParseException;
+import java.util.List;
 
 import static com.genersoft.iot.vmp.gb28181.utils.XmlUtil.getText;
 
@@ -52,13 +54,21 @@ public class BroadcastResponseMessageHandler extends SIPRequestProcessorParent i
         try {
             String channelId = getText(rootElement, "DeviceID");
             DeviceChannel channel = null;
-            if (!channelId.equals(device.getDeviceId())) {
+            if (StringUtils.isNotBlank(channelId) && !channelId.equals(device.getDeviceId())) {
                 channel = deviceChannelService.getOneBySourceId(device.getId(), channelId);
-            }else {
+            } else {
+                // 部分设备回复中的 DeviceID 为空或为设备编号，使用设备下的广播通道
                 channel = deviceChannelService.getBroadcastChannel(device.getId());
             }
             if (channel == null) {
-                log.info("[语音广播]回复： 未找到通道{}/{}", device.getDeviceId(), channelId );
+                // 兜底：使用当前设备正在进行中的语音广播通道
+                List<AudioBroadcastCatch> broadcastCatchList = audioBroadcastManager.getByDeviceId(device.getDeviceId());
+                if (!broadcastCatchList.isEmpty()) {
+                    channel = deviceChannelService.getOneForSourceById(broadcastCatchList.get(0).getChannelId());
+                }
+            }
+            if (channel == null) {
+                log.warn("[语音广播]回复： 未找到通道{}/{}，原始消息：{}", device.getDeviceId(), channelId, rootElement.asXML());
                 // 回复410
                 responseAck((SIPRequest) evt.getRequest(), Response.NOT_FOUND);
                 return;

@@ -5,6 +5,8 @@ import org.apache.ibatis.mapping.DatabaseIdProvider;
 import org.apache.ibatis.mapping.VendorDatabaseIdProvider;
 import org.apache.ibatis.session.SqlSessionFactory;
 import org.mybatis.spring.SqlSessionFactoryBean;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -19,6 +21,8 @@ import java.util.Properties;
 @Configuration
 @Order(value=1)
 public class MybatisConfig {
+
+    private static final Logger log = LoggerFactory.getLogger(MybatisConfig.class);
 
     @Autowired
     private UserSetting userSetting;
@@ -54,9 +58,19 @@ public class MybatisConfig {
             config.setLogImpl(StdOutImpl.class);
         }
         config.setMapUnderscoreToCamelCase(true);
+        String databaseId = databaseIdProvider.getDatabaseId(dataSource);
+        if (databaseId == null) {
+            log.warn("[MyBatis] 未能从数据源识别数据库类型, 回退为 mysql");
+            databaseId = "mysql";
+        }
+        config.setDatabaseId(databaseId);
         sqlSessionFactory.setConfiguration(config);
-        sqlSessionFactory.setDatabaseIdProvider(databaseIdProvider);
-        return sqlSessionFactory.getObject();
+        // 注意: 不可调用 setDatabaseIdProvider, SqlSessionFactoryBean 构建时会用其返回值覆盖 Configuration.databaseId,
+        // 识别失败时返回 null 会覆盖上面的兜底值, 导致 Mapper 无法匹配 databaseId 注解
+        SqlSessionFactory factory = sqlSessionFactory.getObject();
+        log.info("[MyBatis] 数据源识别 databaseId={}, 生效 databaseId={}",
+                databaseId, factory.getConfiguration().getDatabaseId());
+        return factory;
     }
 
 }

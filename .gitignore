@@ -28,3 +28,16 @@ hs_err_pid*
 
 /src/main/resources/static/
 certificates
+
+# 本地运行时数据与构建产物（不入库）
+.DS_Store
+/*.jar
+docker/logs/
+docker/video/
+docker/volumes/
+docker/redis/
+docker/wvp/*.bak*
+docker/zlm-config-fixed.ini.bak
+.trae/
+分析文档/
+openspec/

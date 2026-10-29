@@ -249,6 +249,10 @@
                 <span v-if="broadcastStatus === 0">等待接通中...</span>
                 <span v-if="broadcastStatus === 1">请说话</span>
               </p>
+              <p v-if="!broadcastMode && broadcastAudioCapability === false" style="color: #E6A23C; font-size: 12px;">
+                通道未开启音频，可能只能单向喊话
+              </p>
+              <audio ref="talkAudio" autoplay style="display: none;"></audio>
 
             </div>
           </el-tab-pane>
@@ -293,6 +297,17 @@ export default {
     this.broadcastStatus = -1;
     if (Object.keys(this.player).length === 1) {
       this.activePlayer = Object.keys(this.player)[0]
+    }
+  },
+  beforeDestroy() {
+    this.stopBroadcastStatusPolling();
+    if (this.broadcastRtc) {
+      this.broadcastRtc.close();
+      this.broadcastRtc = null;
+    }
+    if (this.broadcastReceiveRtc) {
+      this.broadcastReceiveRtc.close();
+      this.broadcastReceiveRtc = null;
     }
   },
   data() {
@@ -340,6 +355,10 @@ export default {
       streamInfo: null,
       broadcastMode: true,
       broadcastRtc: null,
+      broadcastReceiveRtc: null,
+      broadcastReceiveUrl: null,
+      broadcastStatusTimer: null,
+      broadcastAudioCapability: true,
       broadcastStatus: -1, // -2 正在释放资源 -1 默认状态 0 等待接通 1 接通成功
     };
   },
@@ -528,40 +547,178 @@ export default {
 
     },
     broadcastStatusClick() {
-      if (this.broadcastStatus == -1) {
-        // 默认状态， 开始
-        this.broadcastStatus = 0
-        // 发起语音对讲
+      if (this.broadcastStatus === 0 || this.broadcastStatus === 1) {
+        this.stopBroadcast();
+        return;
+      }
+      if (this.broadcastStatus !== -1) {
+        return;
+      }
+      // 默认状态， 开始
+      this.broadcastStatus = 0
+      this.broadcastAudioCapability = true;
+      // 发起语音对讲
+      this.$axios({
+        method: 'get',
+        url: '/api/play/broadcast/' + this.deviceId + '/' + this.channelId + "?timeout=30&broadcastMode=" + this.broadcastMode
+      }).then((res) => {
+        if (res.data.code === 0) {
+          let data = res.data.data;
+          let streamInfo = data.streamInfo;
+          if (data.audioCapability === false) {
+            this.broadcastAudioCapability = false;
+            if (!this.broadcastMode) {
+              this.$message({
+                showClose: true,
+                message: '该通道未开启音频，可能只能单向喊话',
+                type: 'warning'
+              });
+            }
+          }
+          if (this.broadcastMode === false && data.receiveStreamInfo) {
+            this.broadcastReceiveUrl = document.location.protocol.includes("https")
+              ? data.receiveStreamInfo.rtcs : data.receiveStreamInfo.rtc;
+          } else {
+            this.broadcastReceiveUrl = null;
+          }
+          this.startBroadcast(document.location.protocol.includes("https") ? streamInfo.rtcs : streamInfo.rtc);
+          this.startBroadcastStatusPolling();
+        } else {
+          this.broadcastStatus = -1;
+          this.$message({
+            showClose: true,
+            message: res.data.msg,
+            type: "error",
+          });
+        }
+      }).catch((e) => {
+        this.broadcastStatus = -1;
+        this.$message({
+          showClose: true,
+          message: '发起语音对讲失败：' + e,
+          type: "error",
+        });
+      });
+    },
+    startReceiveBroadcast(url) {
+      if (!url) {
+        console.warn('回传流地址为空，无法播放设备声音');
+        return;
+      }
+      if (this.broadcastReceiveRtc) {
+        this.broadcastReceiveRtc.close();
+      }
+      console.log("开始播放设备回传音频： " + url);
+      this.$nextTick(() => {
+        if (this.broadcastStatus === -1) {
+          return;
+        }
+        this.broadcastReceiveRtc = new ZLMRTCClient.Endpoint({
+          debug: true,
+          zlmsdpUrl: url,
+          simulecast: false,
+          useCamera: false,
+          audioEnable: true,
+          videoEnable: false,
+          recvOnly: true,
+          element: this.$refs.talkAudio,
+        });
+        this.broadcastReceiveRtc.on(ZLMRTCClient.Events.WEBRTC_NOT_SUPPORT, (e) => {
+          console.error('回传流播放不支持webrtc', e)
+        });
+        this.broadcastReceiveRtc.on(ZLMRTCClient.Events.WEBRTC_OFFER_ANWSER_EXCHANGE_FAILED, (e) => {
+          console.error('回传流 offer anwser 交换失败', e)
+        });
+        this.broadcastReceiveRtc.on(ZLMRTCClient.Events.WEBRTC_ON_CONNECTION_STATE_CHANGE, (e) => {
+          console.log('回传流状态改变', e)
+        });
+      });
+    },
+    startBroadcastStatusPolling() {
+      this.stopBroadcastStatusPolling();
+      const deadline = Date.now() + 30000;
+      const poll = () => {
         this.$axios({
           method: 'get',
-          url: '/api/play/broadcast/' + this.deviceId + '/' + this.channelId + "?timeout=30&broadcastMode=" + this.broadcastMode
+          url: '/api/play/broadcast/status/' + this.deviceId + '/' + this.channelId
         }).then((res) => {
+          if (this.broadcastStatus === -1) {
+            return;
+          }
           if (res.data.code === 0) {
-            let streamInfo = res.data.data.streamInfo;
-            if (document.location.protocol.includes("https")) {
-              this.startBroadcast(streamInfo.rtcs)
-            } else {
-              this.startBroadcast(streamInfo.rtc)
+            let status = res.data.data;
+            if (status.status === 'Failed') {
+              this.broadcastStatus = -1;
+              this.$message({
+                showClose: true,
+                message: status.error || '语音对讲建立失败',
+                type: 'error'
+              });
+              this.stopBroadcast();
+              return;
             }
-          } else {
+            if (status.status === 'Ok') {
+              if (this.broadcastMode || status.receiveStreamReady) {
+                if (!this.broadcastMode && !this.broadcastReceiveRtc && this.broadcastReceiveUrl) {
+                  this.startReceiveBroadcast(this.broadcastReceiveUrl);
+                }
+                this.broadcastStatus = 1;
+                this.stopBroadcastStatusPolling();
+                return;
+              }
+            }
+          }
+          if (Date.now() > deadline) {
+            this.broadcastStatus = -1;
             this.$message({
               showClose: true,
-              message: res.data.msg,
-              type: "error",
+              message: this.broadcastMode ? '语音喊话连接超时' : '语音对讲等待设备回传超时',
+              type: 'error'
             });
+            this.stopBroadcast();
+            return;
           }
+          this.broadcastStatusTimer = setTimeout(poll, 1000);
+        }).catch(() => {
+          if (Date.now() > deadline) {
+            this.broadcastStatus = -1;
+            this.$message({
+              showClose: true,
+              message: '查询对讲状态失败',
+              type: 'error'
+            });
+            this.stopBroadcast();
+            return;
+          }
+          this.broadcastStatusTimer = setTimeout(poll, 1000);
         });
-      } else if (this.broadcastStatus === 1) {
-        this.broadcastStatus = -1;
-        this.broadcastRtc.close()
+      };
+      poll();
+    },
+    stopBroadcastStatusPolling() {
+      if (this.broadcastStatusTimer) {
+        clearTimeout(this.broadcastStatusTimer);
+        this.broadcastStatusTimer = null;
       }
     },
     startBroadcast(url) {
+      if (!url) {
+        this.broadcastStatus = -1;
+        this.$message({
+          showClose: true,
+          message: '推流地址为空，无法开始语音对讲',
+          type: "error",
+        });
+        return;
+      }
       // 获取推流鉴权Key
       this.$axios({
         method: 'post',
         url: '/api/user/userInfo',
       }).then((res) => {
+        if (this.broadcastStatus === -1) {
+          return;
+        }
         if (res.data.code !== 0) {
           this.$message({
             showClose: true,
@@ -618,9 +775,11 @@ export default {
             if (e === "connecting") {
               this.broadcastStatus = 0;
             } else if (e === "connected") {
-              this.broadcastStatus = 1;
+              // 推流连接成功不代表对讲会话已建立，以服务端状态轮询结果为准
+              this.broadcastStatus = 0;
             } else if (e === "disconnected") {
               this.broadcastStatus = -1;
+              this.stopBroadcastStatusPolling();
             }
           });
           this.broadcastRtc.on(ZLMRTCClient.Events.CAPTURE_STREAM_FAILED, (e) => {// offer anwser 交换失败
@@ -645,8 +804,25 @@ export default {
 
     },
     stopBroadcast() {
-      this.broadcastRtc.close();
+      const hadBroadcast = !!this.broadcastRtc || !!this.broadcastReceiveRtc || this.broadcastStatus !== -1;
+      this.stopBroadcastStatusPolling();
+      if (this.broadcastRtc) {
+        this.broadcastRtc.close();
+        this.broadcastRtc = null;
+      }
+      if (this.broadcastReceiveRtc) {
+        this.broadcastReceiveRtc.close();
+        this.broadcastReceiveRtc = null;
+      }
+      if (this.$refs.talkAudio) {
+        this.$refs.talkAudio.pause();
+        this.$refs.talkAudio.srcObject = null;
+      }
+      this.broadcastReceiveUrl = null;
       this.broadcastStatus = -1;
+      if (!hadBroadcast) {
+        return;
+      }
       this.$axios({
         method: 'get',
         url: '/api/play/broadcast/stop/' + this.deviceId + '/' + this.channelId

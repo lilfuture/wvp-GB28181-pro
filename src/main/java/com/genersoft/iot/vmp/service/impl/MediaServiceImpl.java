@@ -67,6 +67,10 @@ public class MediaServiceImpl implements IMediaService {
         if ("rtp".equals(app)) {
             return true;
         }
+        // 设备回传音频流由平台内部会话产生，不再额外要求播放鉴权
+        if ("talk".equals(app) && stream.endsWith("_talk")) {
+            return true;
+        }
         StreamAuthorityInfo streamAuthorityInfo = redisCatchStorage.getStreamAuthorityInfo(app, stream);
         if (streamAuthorityInfo == null || streamAuthorityInfo.getCallId() == null) {
             return true;

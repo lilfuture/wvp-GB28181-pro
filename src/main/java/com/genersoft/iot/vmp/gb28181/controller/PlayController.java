@@ -22,6 +22,7 @@ import com.genersoft.iot.vmp.media.service.IMediaServerService;
 import com.genersoft.iot.vmp.service.bean.InviteErrorCode;
 import com.genersoft.iot.vmp.utils.DateUtil;
 import com.genersoft.iot.vmp.vmanager.bean.AudioBroadcastResult;
+import com.genersoft.iot.vmp.vmanager.bean.AudioBroadcastStatus;
 import com.genersoft.iot.vmp.vmanager.bean.ErrorCode;
 import com.genersoft.iot.vmp.vmanager.bean.StreamContent;
 import com.genersoft.iot.vmp.vmanager.bean.WVPResult;
@@ -234,6 +235,22 @@ public class PlayController {
 		DeviceChannel channel = deviceChannelService.getOne(deviceId, channelId);
 		Assert.notNull(channel, "通道不存在");
 		playService.stopAudioBroadcast(device, channel);
+	}
+
+	@Operation(summary = "获取语音广播/对讲状态", security = @SecurityRequirement(name = JwtUtils.HEADER))
+	@Parameter(name = "deviceId", description = "设备国标编号", required = true)
+	@Parameter(name = "channelId", description = "通道国标编号", required = true)
+	@GetMapping("/broadcast/status/{deviceId}/{channelId}")
+	public AudioBroadcastStatus broadcastStatus(@PathVariable String deviceId, @PathVariable String channelId) {
+		Device device = deviceService.getDeviceByDeviceId(deviceId);
+		if (device == null) {
+			throw new ControllerException(ErrorCode.ERROR400.getCode(), "未找到设备： " + deviceId);
+		}
+		DeviceChannel channel = deviceChannelService.getOne(deviceId, channelId);
+		if (channel == null) {
+			throw new ControllerException(ErrorCode.ERROR400.getCode(), "未找到通道： " + channelId);
+		}
+		return playService.getAudioBroadcastStatus(device, channel);
 	}
 
 	@Operation(summary = "获取所有的ssrc", security = @SecurityRequirement(name = JwtUtils.HEADER))

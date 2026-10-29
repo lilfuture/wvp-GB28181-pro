@@ -90,7 +90,7 @@
                     <version>3.1.0</version>
                     <scope>provided</scope>
                 </dependency>
-            </dependencies>
+</dependencies>
         </profile>
     </profiles>
 
@@ -222,9 +222,10 @@
 
         <!--参数校验 -->
         <dependency>
-            <groupId>javax.validation</groupId>
-            <artifactId>validation-api</artifactId>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
+
 
         <!-- 日志相关 -->
         <dependency>

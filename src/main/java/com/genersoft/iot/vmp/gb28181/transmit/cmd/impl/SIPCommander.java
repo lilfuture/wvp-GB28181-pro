@@ -14,6 +14,7 @@ import com.genersoft.iot.vmp.gb28181.transmit.cmd.ISIPCommander;
 import com.genersoft.iot.vmp.gb28181.transmit.cmd.SIPRequestHeaderProvider;
 import com.genersoft.iot.vmp.gb28181.utils.NumericUtil;
 import com.genersoft.iot.vmp.gb28181.utils.SipUtils;
+import com.genersoft.iot.vmp.gb28181.utils.TalkUtils;
 import com.genersoft.iot.vmp.media.bean.MediaServer;
 import com.genersoft.iot.vmp.media.event.hook.Hook;
 import com.genersoft.iot.vmp.media.event.hook.HookSubscribe;
@@ -543,13 +544,21 @@ public class SIPCommander implements ISIPCommander {
             return;
         }
         if (!mediaServerItem.isRtpEnable()) {
-            // 单端口暂不支持语音喊话
-            log.info("[语音喊话] 单端口暂不支持此操作");
+            // 单端口模式下无法为设备回传流分配独立端口，直接返回明确错误
+            log.warn("[语音对讲] 当前媒体服务未开启多端口模式，无法建立对讲: {}", mediaServerItem.getId());
+            if (errorEvent != null) {
+                SipSubscribe.EventResult eventResult = new SipSubscribe.EventResult();
+                eventResult.type = SipSubscribe.EventResultType.cmdSendFailEvent;
+                eventResult.statusCode = -1;
+                eventResult.msg = "当前媒体服务未开启多端口模式，无法建立语音对讲";
+                errorEvent.response(eventResult);
+            }
             return;
         }
 
-        log.info("[语音喊话] {} 分配的ZLM为: {} [{}:{}]", stream, mediaServerItem.getId(), mediaServerItem.getIp(), sendRtpItem.getPort());
-        Hook hook = Hook.getInstance(HookType.on_media_arrival, "rtp", stream, mediaServerItem.getId());
+        log.info("[语音对讲] {} 分配的ZLM为: {} [{}:{}]", stream, mediaServerItem.getId(), mediaServerItem.getIp(), sendRtpItem.getPort());
+        String receiveStream = TalkUtils.buildReceiveStream(stream);
+        Hook hook = Hook.getInstance(HookType.on_media_arrival, TalkUtils.APP_TALK, receiveStream, mediaServerItem.getId());
         subscribe.addSubscribe(hook, (hookData) -> {
             if (event != null) {
                 event.response(hookData);
@@ -559,11 +568,12 @@ public class SIPCommander implements ISIPCommander {
 
         CallIdHeader callIdHeader = sipSender.getNewCallIdHeader(sipLayer.getLocalIp(device.getLocalIp()), device.getTransport());
         callIdHeader.setCallId(callId);
-        Hook publishHook = Hook.getInstance(HookType.on_publish, "rtp", stream, mediaServerItem.getId());
+        Hook publishHook = Hook.getInstance(HookType.on_publish, TalkUtils.APP_TALK, stream, mediaServerItem.getId());
         subscribe.addSubscribe(publishHook, (hookData) -> {
             if (eventForPush != null) {
                 eventForPush.response(hookData);
             }
+            subscribe.removeSubscribe(publishHook);
         });
         //
         StringBuffer content = new StringBuffer(200);
@@ -573,11 +583,39 @@ public class SIPCommander implements ISIPCommander {
         content.append("c=IN IP4 " + mediaServerItem.getSdpIp() + "\r\n");
         content.append("t=0 0\r\n");
 
-        content.append("m=audio " + sendRtpItem.getPort() + " TCP/RTP/AVP 8\r\n");
-        content.append("a=setup:passive\r\n");
-        content.append("a=connection:new\r\n");
+        String streamMode = device.getStreamMode();
+        // 平台真实收流端口：被动监听成功后的端口优先，否则回退端口池分配的本地端口
+        int platformPort = sendRtpItem.getPort() > 0 ? sendRtpItem.getPort() : sendRtpItem.getLocalPort();
+        if (!"TCP-ACTIVE".equalsIgnoreCase(streamMode) && platformPort <= 0) {
+            // 端口无效时不发送 INVITE，避免设备拿到 m=audio 0/9 这类无意义目标
+            log.error("[语音对讲] 平台收流端口无效，终止发送INVITE: {}", stream);
+            if (errorEvent != null) {
+                SipSubscribe.EventResult eventResult = new SipSubscribe.EventResult();
+                eventResult.type = SipSubscribe.EventResultType.cmdSendFailEvent;
+                eventResult.statusCode = -1;
+                eventResult.msg = "平台收流端口无效";
+                errorEvent.response(eventResult);
+            }
+            return;
+        }
+        // 同时提供 PCMA/8000(8) 与 PS/90000(96)，兼容只支持 PS 封装音频的设备
+        if ("TCP-ACTIVE".equalsIgnoreCase(streamMode)) {
+            // 平台主动连接设备，真实端口由设备 200 OK 的 SDP 给出，此处按 RFC4145 写占位端口 9
+            content.append("m=audio 9 TCP/RTP/AVP 8 96\r\n");
+            content.append("a=setup:active\r\n");
+            content.append("a=connection:new\r\n");
+        } else if ("UDP".equalsIgnoreCase(streamMode)) {
+            // UDP：必须把平台真实端口写给设备，否则设备没有回传目标（端口 9 为丢弃端口）
+            content.append("m=audio " + platformPort + " RTP/AVP 8 96\r\n");
+        } else {
+            // 默认 TCP-PASSIVE：平台先监听，SDP 必须与真实监听端口一致
+            content.append("m=audio " + platformPort + " TCP/RTP/AVP 8 96\r\n");
+            content.append("a=setup:passive\r\n");
+            content.append("a=connection:new\r\n");
+        }
         content.append("a=sendrecv\r\n");
         content.append("a=rtpmap:8 PCMA/8000\r\n");
+        content.append("a=rtpmap:96 PS/90000\r\n");
 
         content.append("y=" + sendRtpItem.getSsrc() + "\r\n");//ssrc
         // f字段:f= v/编码格式/分辨率/帧率/码率类型/码率大小a/编码格式/码率大小/采样率
@@ -586,14 +624,12 @@ public class SIPCommander implements ISIPCommander {
         Request request = headerProvider.createInviteRequest(device, channel.getDeviceId(), content.toString(),
                 SipUtils.getNewViaTag(), SipUtils.getNewFromTag(), null, sendRtpItem.getSsrc(), callIdHeader);
         sipSender.transmitRequest(sipLayer.getLocalIp(device.getLocalIp()), request, (e -> {
-            sessionManager.removeByStream(sendRtpItem.getStream());
-            mediaServerService.releaseSsrc(mediaServerItem.getId(), sendRtpItem.getSsrc());
             errorEvent.response(e);
         }), e -> {
             // 这里为例避免一个通道的点播只有一个callID这个参数使用一个固定值
             ResponseEvent responseEvent = (ResponseEvent) e.event;
             SIPResponse response = (SIPResponse) responseEvent.getResponse();
-            SsrcTransaction ssrcTransaction = SsrcTransaction.buildForDevice(device.getDeviceId(), channel.getId(), "talk", stream, sendRtpItem.getSsrc(), mediaServerItem.getId(), response, InviteSessionType.TALK);
+            SsrcTransaction ssrcTransaction = SsrcTransaction.buildForDevice(device.getDeviceId(), channel.getId(), TalkUtils.APP_TALK, stream, sendRtpItem.getSsrc(), mediaServerItem.getId(), response, InviteSessionType.TALK);
             sessionManager.put(ssrcTransaction);
             okEvent.response(e);
         }, timeout);
