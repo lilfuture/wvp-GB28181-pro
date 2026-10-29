@@ -1,7 +1,7 @@
 FROM eclipse-temurin:17-jdk-jammy AS build
 
 ARG gitUrl="https://gitee.com/pan648540858"
-ARG wvpGitUrl="https://gitcode.com/weixin_44480784/wvp-GB28181-pro.git"
+ARG wvpGitUrl="https://github.com/lilfuture/wvp-GB28181-pro.git"
 ARG zlmGitUrl="https://gitee.com/xia-chu/ZLMediaKit"
 
 RUN sed -i 's|archive.ubuntu.com|mirrors.aliyun.com|g' /etc/apt/sources.list && \
